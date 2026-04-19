@@ -101,6 +101,7 @@ function handleCommand(text: string): void {
         `  demo styles     粗体/斜体/下划线/反显等`,
         `  demo cursor     滚动与草稿重绘说明`,
         `  clear           清空对话记录（仅内存）`,
+        `  Shift+Enter    插入换行；Enter 发送整段`,
         `  （编辑）首行↑/末行↓ 历史；Ctrl+C 清空草稿，空时再按提示退出`,
         "",
       ].join("\n"),
