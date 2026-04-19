@@ -320,11 +320,6 @@ function handleKey(_str: string | undefined, key: Key): boolean {
     editor.moveLineEnd();
     return true;
   }
-  if (key.ctrl && key.name === "j") {
-    editor.insertNewline();
-    noteBufferMutation();
-    return true;
-  }
 
   if (looksLikeModifiedEnterSequence(key)) {
     editor.insertNewline();

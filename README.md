@@ -156,7 +156,7 @@ process.stdin.on("keypress", (str, key) => {
 
 ## 注意事项
 
-- **Shift+Enter**：换行以它为准；除 `key.shift` 外，还会识别 **`key.sequence` 以 ESC 开头且以 CR/LF 结尾** 的 Return（不少终端 raw 下用 CSI 表示修饰键而不置 `shift`）。仅当与普通 Enter 字节完全无法区分时，才在代码里保留 **Ctrl+J**（LF）作兜底，文档与界面不再把它当主操作宣传。
+- **Shift+Enter**：换行以它为准；除 `key.shift` 外，还会识别 **`key.sequence` 以 ESC 开头且以 CR/LF 结尾** 的 Return（不少终端 raw 下用 CSI 表示修饰键而不置 `shift`）。
 - **宽字符**（中文等）在「列对齐」里用「宽=2、ASCII=1」的粗估；极端排版以真实终端为准。
 - 若在非 TTY 管道里运行，程序会拒绝启动并提示到真实终端执行。
 
