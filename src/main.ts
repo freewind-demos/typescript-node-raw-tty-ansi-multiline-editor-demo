@@ -287,6 +287,23 @@ function historyNext(): void {
   editor.clear();
 }
 
+/** 多终端下 Shift+Enter 不一定带 key.shift；常见为 CSI + CR/LF */
+function wantsSoftNewline(key: Key): boolean {
+  if (key.shift) return true;
+  const s = key.sequence ?? "";
+  if ((key.name === "return" || key.name === "enter") && s.startsWith("\x1b")) return true;
+  return false;
+}
+
+/** 未解析成 return，但整段是「修饰键 + 换行」时避免 insertText 把 ESC 当字符写进去 */
+function looksLikeModifiedEnterSequence(key: Key): boolean {
+  if (key.ctrl) return false;
+  const s = key.sequence ?? "";
+  if (s.length < 2) return false;
+  if (!s.startsWith("\x1b")) return false;
+  return s.endsWith("\r") || s.endsWith("\n");
+}
+
 function handleKey(_str: string | undefined, key: Key): boolean {
   if (key.ctrl && key.name === "c") {
     handleCtrlC();
@@ -308,8 +325,14 @@ function handleKey(_str: string | undefined, key: Key): boolean {
     return true;
   }
 
+  if (looksLikeModifiedEnterSequence(key)) {
+    editor.insertNewline();
+    noteBufferMutation();
+    return true;
+  }
+
   if (key.name === "return" || key.name === "enter") {
-    if (key.shift) {
+    if (wantsSoftNewline(key)) {
       editor.insertNewline();
       noteBufferMutation();
     } else onSubmit();

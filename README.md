@@ -156,7 +156,7 @@ process.stdin.on("keypress", (str, key) => {
 
 ## 注意事项
 
-- **Shift+Enter** 依赖终端把修饰键信息传给 Node；若你终端里 Shift+Enter 与普通 Enter 字节完全相同，则无法用 shift 区分。此时请用 **Ctrl+J**（ASCII LF）作为换行备选（本程序已支持）。
+- **Shift+Enter**：除 `key.shift` 外，程序会把 **`key.sequence` 以 ESC 开头且以 CR/LF 结尾** 的按键也当作「软换行」（不少终端在 raw 下不按 shift 位上报）。若仍与普通 Enter 完全相同，请用 **Ctrl+J** 换行。
 - **宽字符**（中文等）在「列对齐」里用「宽=2、ASCII=1」的粗估；极端排版以真实终端为准。
 - 若在非 TTY 管道里运行，程序会拒绝启动并提示到真实终端执行。
 
