@@ -15,6 +15,12 @@ const editor = createEditor();
 /** 上次画在屏幕上的草稿行数（用于上移擦除） */
 let prevDraftLines = 0;
 
+/**
+ * placeDraftCursor 会把光标移进草稿行；下次若仍从「行内」做 nA，会误进 transcript 被 0J 吃掉。
+ * 在草稿最后一行之下用 \\x1b[s 存锚点，重画/插正文前 \\x1b[u 回到该点再 nA。
+ */
+let draftAnchorSaved = false;
+
 /** >0 时 appendTranscriptBlock 末尾不立刻 refresh（给 onSubmit 等批处理） */
 let draftRefreshBatchDepth = 0;
 
@@ -27,19 +33,27 @@ function trimLogMemory(): void {
   if (log.length > max) log = log.slice(log.length - max);
 }
 
-/** 先擦掉当前草稿，再追加多行正文（像 python / node REPL 一样往下长） */
-function appendTranscriptBlock(block: string): void {
+/** 回到「草稿块起点」再擦掉草稿（光标须在块下或已 u 回锚点） */
+function moveToDraftEraseAnchor(): void {
   const out = process.stdout;
+  if (draftAnchorSaved) out.write("\x1b[u");
   if (prevDraftLines > 0) {
     out.write(`\x1b[${prevDraftLines}A\x1b[0J`);
     prevDraftLines = 0;
   }
+}
+
+/** 先擦掉当前草稿，再追加多行正文（像 python / node REPL 一样往下长） */
+function appendTranscriptBlock(block: string): void {
+  const out = process.stdout;
+  moveToDraftEraseAnchor();
   const lines = block.split("\n");
   for (const ln of lines) {
     log.push(ln);
     out.write(ln + ansi.clearLineEnd + "\n");
   }
   trimLogMemory();
+  draftAnchorSaved = false;
   if (draftRefreshBatchDepth === 0) refreshDraft();
 }
 
@@ -133,7 +147,7 @@ function handleCommand(text: string): void {
     pushAssistant(
       [
         `${ansi.bold}REPL 式滚动${ansi.reset}：不启用备用屏、不用 \\x1b[2J 清整屏；正文用普通换行往下长。`,
-        `多行草稿：${ansi.dim}每次按键先把光标上移 prevDraftLines 行，\\x1b[0J 从该处清到屏幕末，再重画草稿行。${ansi.reset}`,
+        `多行草稿：${ansi.dim}每次先 \\x1b[u 回到草稿块下的锚点（\\x1b[s 存的），再 nA+\\x1b[0J 擦掉草稿，避免从行内 nA 误伤上面的 transcript。${ansi.reset}`,
       ].join("\n"),
     );
     return;
@@ -172,15 +186,15 @@ function refreshDraft(): void {
   const rowStr = editor.lines[cy] ?? "";
 
   out.write(ansi.hideCursor);
-  if (prevDraftLines > 0) {
-    out.write(`\x1b[${prevDraftLines}A\x1b[0J`);
-  }
+  moveToDraftEraseAnchor();
   for (const line of lines) {
     out.write(line + ansi.clearLineEnd + "\n");
   }
   prevDraftLines = n;
+  out.write("\x1b[s");
   placeDraftCursor(n, cy, cx, rowStr);
   out.write(ansi.showCursor);
+  draftAnchorSaved = true;
 }
 
 function pushUserTurn(text: string): void {
