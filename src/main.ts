@@ -31,17 +31,20 @@ function visualLen(s: string): number {
   return v;
 }
 
-function padToVisual(s: string, target: number): string {
-  const v = visualLen(s);
-  if (v >= target) return s;
-  return s + " ".repeat(target - v);
+function pushAssistant(block: string): void {
+  const parts = block.split("\n");
+  const head = parts[0] ?? "";
+  pushLog(`${ansi.fg(5)}程序${ansi.reset} ${head}`);
+  for (let i = 1; i < parts.length; i++) {
+    pushLog(`  ${ansi.dim}${parts[i] ?? ""}${ansi.reset}`);
+  }
 }
 
 function handleCommand(text: string): void {
   const t = text.trim();
   const lower = t.toLowerCase();
   if (lower === "help" || lower === "?") {
-    pushLog(
+    pushAssistant(
       [
         `${ansi.bold}可用命令${ansi.reset}（整段发送，可多行）：`,
         `  help / ?        本说明`,
@@ -50,7 +53,7 @@ function handleCommand(text: string): void {
         `  demo truecolor  24bit 渐变`,
         `  demo styles     粗体/斜体/下划线/反显等`,
         `  demo cursor     光标移动演示`,
-        `  clear           清空下方输出区`,
+        `  clear           清空对话记录`,
         `  （编辑）首行↑/末行↓ 切上一条/下一条历史；Ctrl+C 清空，空时连按提示后退出`,
         "",
       ].join("\n"),
@@ -59,20 +62,20 @@ function handleCommand(text: string): void {
   }
   if (lower === "clear") {
     log = [];
-    pushLog(`${ansi.dim}输出区已清空${ansi.reset}`);
+    pushLog(`${ansi.dim}对话已清空${ansi.reset}`);
     return;
   }
   if (lower === "demo sgr") {
     const row = Array.from({ length: 8 }, (_, i) => `${ansi.fg(i as 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7)}█${ansi.reset}`).join(
       "",
     );
-    pushLog(`${ansi.bold}前景 30–37${ansi.reset}\n${row}`);
+    pushAssistant(`${ansi.bold}前景 30–37${ansi.reset}\n${row}`);
     return;
   }
   if (lower === "demo 256") {
     let s = `${ansi.bold}256 色（38;5;n）${ansi.reset}\n`;
     for (let i = 16; i < 52; i++) s += ansi.fg256(i) + "█" + ansi.reset;
-    pushLog(s);
+    pushAssistant(s);
     return;
   }
   if (lower === "demo truecolor") {
@@ -81,11 +84,11 @@ function handleCommand(text: string): void {
       const r = Math.round((x / 47) * 255);
       s += ansi.fgTrue(r, 80, 200) + "▓" + ansi.reset;
     }
-    pushLog(s);
+    pushAssistant(s);
     return;
   }
   if (lower === "demo styles") {
-    pushLog(
+    pushAssistant(
       [
         `${ansi.bold}bold${ansi.reset}  ${ansi.dim}dim${ansi.reset}  ${ansi.italic}italic${ansi.reset}  ${ansi.underline}underline${ansi.reset}`,
         `${ansi.strikethrough}strikethrough${ansi.reset}  ${ansi.inverse}inverse${ansi.reset}${ansi.reset}`,
@@ -94,80 +97,65 @@ function handleCommand(text: string): void {
     return;
   }
   if (lower === "demo cursor") {
-    pushLog(
+    pushAssistant(
       [
         `${ansi.bold}光标定位${ansi.reset}：ANSI 序列 ${ansi.dim}CSI row;col H${ansi.reset}（本程序里即 \\x1b[row;colH）。`,
-        `全屏重绘时先 ${ansi.dim}\\x1b[H\\x1b[2J${ansi.reset} 清屏回左上角，再打印整块 UI，最后把光标移到输入处。`,
+        `单流对话：${ansi.dim}log + 当前草稿${ansi.reset} 合成一列，自下而上滚动；光标只在草稿行。`,
       ].join("\n"),
     );
     return;
   }
   const lines = text.split("\n").length;
   const chars = [...text].length;
-  pushLog(
+  pushAssistant(
     `${ansi.fg(6)}回显${ansi.reset} 行=${lines} 字=${chars}\n${ansi.dim}${text.replaceAll("\n", "↵ ")}${ansi.reset}`,
   );
+}
+
+/** 当前草稿行并入对话流（前缀两列：光标行 `>`，其余 `·`） */
+function draftLinesForStream(): string[] {
+  return editor.lines.map((row, i) => {
+    const mark =
+      i === editor.cur.line
+        ? `${ansi.fg(4)}>${ansi.reset}`
+        : `${ansi.dim}·${ansi.reset}`;
+    return `${mark} ${row}`;
+  });
 }
 
 function redraw(): void {
   const w = termW();
   const h = termH();
-  const headerH = 11;
-  const inputH = Math.min(8, Math.max(3, h - headerH - 6));
-  const outH = Math.max(2, h - headerH - inputH - 2);
+  const headerRows = 1;
+  const bodyH = Math.max(3, h - headerRows);
 
   const buf = editor.lines;
   const cy = editor.cur.line;
   const cx = editor.cur.col;
 
-  let startLine = 0;
-  if (buf.length > inputH) {
-    startLine = Math.min(
-      Math.max(0, cy - Math.floor(inputH / 2)),
-      buf.length - inputH,
-    );
-  }
-  const absCy = cy - startLine;
+  const draftVis = draftLinesForStream();
+  const merged: string[] = [...log, ...draftVis];
+  const cursorMerged = log.length + cy;
 
-  const last = log.slice(-outH);
-  while (last.length < outH) last.unshift("");
+  let start = Math.max(0, merged.length - bodyH);
+  if (cursorMerged < start) start = cursorMerged;
+  if (cursorMerged >= start + bodyH) start = cursorMerged - bodyH + 1;
+  start = Math.max(0, Math.min(start, Math.max(0, merged.length - bodyH)));
+
+  const slice = merged.slice(start, start + bodyH);
+  const padTop = bodyH - slice.length;
+  const vis: string[] = [...Array.from({ length: padTop }, () => ""), ...slice];
 
   let s = ansi.hideCursor + ansi.home + ansi.clearScreen;
 
-  s += `${ansi.bold}${ansi.fg(4)}TTY / ANSI 多行输入演示${ansi.reset}  ${ansi.dim}Ctrl+C 清空；输入空时再按提示退出${ansi.reset}\n`;
-  s += `${ansi.dim}命令：${ansi.reset}${ansi.fg(2)}help${ansi.reset} ${ansi.fg(2)}demo sgr${ansi.reset} ${ansi.fg(2)}demo 256${ansi.reset} ${ansi.fg(2)}demo truecolor${ansi.reset} ${ansi.fg(2)}demo styles${ansi.reset} ${ansi.fg(2)}demo cursor${ansi.reset} ${ansi.fg(2)}clear${ansi.reset}\n`;
-  s += `${ansi.dim}Enter=发送  Shift+Enter=换行  ↑↓=行内移动；首行↑/末行↓=上一条/下一条历史  Ctrl+C×3=清空→提示→退出${ansi.reset}\n`;
-  s += `${ansi.dim}Delete 粘贴  Ctrl+A/E 行首/尾  Ctrl+J=换行备选${ansi.reset}\n`;
-  s += "\n";
+  s += `${ansi.bold}${ansi.fg(4)}对话式 TTY${ansi.reset} ${ansi.dim}Enter 发送 · Shift+Enter 换行 · help · 首行↑/末行↓ 历史 · Ctrl+C 清空→空时再按退出${ansi.reset}${ansi.clearLineEnd}\n`;
 
-  for (let i = 0; i < outH; i++) {
-    const line = last[i] ?? "";
-    s += `${ansi.dim}│${ansi.reset}${line}${ansi.clearLineEnd}\n`;
+  for (const line of vis) {
+    s += line + ansi.clearLineEnd + "\n";
   }
 
-  s += `${ansi.dim}${"─".repeat(Math.min(w, 72))}${ansi.reset}\n`;
-
-  const vis = buf.slice(startLine, startLine + inputH);
-  const rows: string[] = [];
-  for (let i = 0; i < inputH; i++) {
-    const rowText = vis[i] ?? "";
-    const mark = i === absCy ? `${ansi.bold}>${ansi.reset}` : " ";
-    const innerW = Math.max(1, w - 3);
-    const body = padToVisual(rowText, innerW);
-    rows.push(
-      ansi.inputZoneBg +
-        ansi.inputZoneFg +
-        mark +
-        " " +
-        body +
-        ansi.reset +
-        ansi.clearLineEnd,
-    );
-  }
-  s += rows.join("\n") + "\n";
-
-  const firstInputRow = h - inputH + 1;
-  const cursorRow = firstInputRow + absCy;
+  const rel = padTop + (cursorMerged - start);
+  const cursorRow = headerRows + 1 + rel;
   const rowStr = buf[cy] ?? "";
   const sliceLeft = rowStr.slice(0, cx);
   const prefixCols = 3;
@@ -177,6 +165,15 @@ function redraw(): void {
 
   s += ansi.moveTo(cursorRow, col) + ansi.showCursor;
   process.stdout.write(s);
+}
+
+function pushUserTurn(text: string): void {
+  const parts = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  const head = parts[0] ?? "";
+  pushLog(`${ansi.bold}你${ansi.reset} ${head}`);
+  for (let i = 1; i < parts.length; i++) {
+    pushLog(`${ansi.dim}  ${parts[i] ?? ""}${ansi.reset}`);
+  }
 }
 
 function onSubmit(): void {
@@ -190,6 +187,7 @@ function onSubmit(): void {
   submitHistory.push(text);
   historyPos = null;
   ctrlCExitStage = 0;
+  pushUserTurn(text);
   handleCommand(text);
   editor.resetAfterSubmit();
   redraw();
