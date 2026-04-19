@@ -12,6 +12,13 @@ type LogLine = string;
 let log: LogLine[] = [];
 const editor = createEditor();
 
+/** 已发送过的正文（旧 → 新） */
+let submitHistory: string[] = [];
+/** null=编辑新内容；否则为 submitHistory 下标 */
+let historyPos: number | null = null;
+/** Ctrl+C 连按：0 正常；1 已提示再按退出 */
+let ctrlCExitStage = 0;
+
 function pushLog(block: string): void {
   for (const ln of block.split("\n")) log.push(ln);
   const max = Math.max(40, termH() * 6);
@@ -44,6 +51,7 @@ function handleCommand(text: string): void {
         `  demo styles     粗体/斜体/下划线/反显等`,
         `  demo cursor     光标移动演示`,
         `  clear           清空下方输出区`,
+        `  （编辑）首行↑/末行↓ 切上一条/下一条历史；Ctrl+C 清空，空时连按提示后退出`,
         "",
       ].join("\n"),
     );
@@ -104,7 +112,7 @@ function handleCommand(text: string): void {
 function redraw(): void {
   const w = termW();
   const h = termH();
-  const headerH = 10;
+  const headerH = 11;
   const inputH = Math.min(8, Math.max(3, h - headerH - 6));
   const outH = Math.max(2, h - headerH - inputH - 2);
 
@@ -126,9 +134,10 @@ function redraw(): void {
 
   let s = ansi.hideCursor + ansi.home + ansi.clearScreen;
 
-  s += `${ansi.bold}${ansi.fg(4)}TTY / ANSI 多行输入演示${ansi.reset}  ${ansi.dim}Ctrl+C 退出${ansi.reset}\n`;
+  s += `${ansi.bold}${ansi.fg(4)}TTY / ANSI 多行输入演示${ansi.reset}  ${ansi.dim}Ctrl+C 清空；输入空时再按提示退出${ansi.reset}\n`;
   s += `${ansi.dim}命令：${ansi.reset}${ansi.fg(2)}help${ansi.reset} ${ansi.fg(2)}demo sgr${ansi.reset} ${ansi.fg(2)}demo 256${ansi.reset} ${ansi.fg(2)}demo truecolor${ansi.reset} ${ansi.fg(2)}demo styles${ansi.reset} ${ansi.fg(2)}demo cursor${ansi.reset} ${ansi.fg(2)}clear${ansi.reset}\n`;
-  s += `${ansi.dim}Enter=发送整段  Shift+Enter=换行  方向键移动  Delete 粘贴  Ctrl+A/E 行首/尾  Ctrl+J=换行备选${ansi.reset}\n`;
+  s += `${ansi.dim}Enter=发送  Shift+Enter=换行  ↑↓=行内移动；首行↑/末行↓=上一条/下一条历史  Ctrl+C×3=清空→提示→退出${ansi.reset}\n`;
+  s += `${ansi.dim}Delete 粘贴  Ctrl+A/E 行首/尾  Ctrl+J=换行备选${ansi.reset}\n`;
   s += "\n";
 
   for (let i = 0; i < outH; i++) {
@@ -174,16 +183,87 @@ function onSubmit(): void {
   const text = editor.getText();
   if (!text.trim()) {
     editor.resetAfterSubmit();
+    historyPos = null;
     redraw();
     return;
   }
+  submitHistory.push(text);
+  historyPos = null;
+  ctrlCExitStage = 0;
   handleCommand(text);
   editor.resetAfterSubmit();
   redraw();
 }
 
+function inputHasChars(): boolean {
+  return editor.getText().length > 0;
+}
+
+function resetExitHint(): void {
+  ctrlCExitStage = 0;
+}
+
+function leaveHistoryBrowse(): void {
+  historyPos = null;
+}
+
+function noteBufferMutation(): void {
+  resetExitHint();
+  leaveHistoryBrowse();
+}
+
+/** Ctrl+C：仅在 keypress 里处理；另挂空 SIGINT 防止 Node 默认直接退出 */
+function handleCtrlC(): void {
+  if (inputHasChars()) {
+    editor.clear();
+    resetExitHint();
+    leaveHistoryBrowse();
+    redraw();
+    return;
+  }
+  if (ctrlCExitStage === 0) {
+    ctrlCExitStage = 1;
+    pushLog(
+      `${ansi.fg(1)}Ctrl+C${ansi.reset}：${ansi.bold}再按一次 Ctrl+C 将退出程序。${ansi.reset}`,
+    );
+    redraw();
+    return;
+  }
+  cleanup();
+  process.exit(0);
+}
+
+function historyPrev(): void {
+  if (submitHistory.length === 0) return;
+  if (historyPos === null) {
+    historyPos = submitHistory.length - 1;
+  } else if (historyPos > 0) {
+    historyPos--;
+  } else {
+    return;
+  }
+  resetExitHint();
+  editor.loadFromString(submitHistory[historyPos] ?? "");
+}
+
+function historyNext(): void {
+  if (historyPos === null) return;
+  if (historyPos < submitHistory.length - 1) {
+    historyPos++;
+    resetExitHint();
+    editor.loadFromString(submitHistory[historyPos] ?? "");
+    return;
+  }
+  historyPos = null;
+  resetExitHint();
+  editor.clear();
+}
+
 function handleKey(_str: string | undefined, key: Key): boolean {
-  if (key.ctrl && key.name === "c") return false;
+  if (key.ctrl && key.name === "c") {
+    handleCtrlC();
+    return true;
+  }
   if (key.name === "escape") return true;
 
   if (key.ctrl && key.name === "a") {
@@ -196,21 +276,26 @@ function handleKey(_str: string | undefined, key: Key): boolean {
   }
   if (key.ctrl && key.name === "j") {
     editor.insertNewline();
+    noteBufferMutation();
     return true;
   }
 
   if (key.name === "return" || key.name === "enter") {
-    if (key.shift) editor.insertNewline();
-    else onSubmit();
+    if (key.shift) {
+      editor.insertNewline();
+      noteBufferMutation();
+    } else onSubmit();
     return true;
   }
 
   if (key.name === "up") {
-    editor.moveUp();
+    if (editor.cur.line > 0) editor.moveUp();
+    else historyPrev();
     return true;
   }
   if (key.name === "down") {
-    editor.moveDown();
+    if (editor.cur.line < editor.lines.length - 1) editor.moveDown();
+    else historyNext();
     return true;
   }
   if (key.name === "left") {
@@ -223,26 +308,31 @@ function handleKey(_str: string | undefined, key: Key): boolean {
   }
   if (key.name === "backspace") {
     editor.backspace();
+    noteBufferMutation();
     return true;
   }
   if (key.name === "delete" || key.name === "forwarddelete") {
     editor.deleteForward();
+    noteBufferMutation();
     return true;
   }
   if (key.name === "tab") {
     editor.insertText("  ");
+    noteBufferMutation();
     return true;
   }
 
   const seq = key.sequence ?? "";
   if (seq && !key.ctrl && !key.meta && key.name === undefined) {
     editor.insertText(seq);
+    noteBufferMutation();
     return true;
   }
 
   if (_str && !key.ctrl && !key.meta) {
     if (key.name && ["return", "enter", "tab"].includes(key.name)) return true;
     editor.insertText(_str);
+    noteBufferMutation();
     return true;
   }
 
@@ -264,10 +354,7 @@ function main(): void {
   readline.emitKeypressEvents(process.stdin);
   process.stdin.setRawMode(true);
   process.stdout.write(ansi.altScreenOn);
-  process.on("SIGINT", () => {
-    cleanup();
-    process.exit(0);
-  });
+  process.on("SIGINT", () => {});
 
   pushLog(`${ansi.fg(3)}就绪。${ansi.reset} 输入 ${ansi.bold}help${ansi.reset} 查看命令。`);
   redraw();

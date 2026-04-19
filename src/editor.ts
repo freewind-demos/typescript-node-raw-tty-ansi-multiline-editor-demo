@@ -130,6 +130,15 @@ export class MultilineEditor {
     this.cur = { line: 0, col: 0 };
   }
 
+  /** 整段替换（用于历史召回） */
+  loadFromString(text: string): void {
+    const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    this.lines = normalized.length ? normalized.split("\n") : [""];
+    const last = this.lines.length - 1;
+    const lastRow = this.lines[last] ?? "";
+    this.cur = { line: last, col: lastRow.length };
+  }
+
   getText(): string {
     return this.lines.join("\n");
   }
