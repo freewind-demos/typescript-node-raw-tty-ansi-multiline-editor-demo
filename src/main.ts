@@ -12,17 +12,48 @@ type LogLine = string;
 let log: LogLine[] = [];
 const editor = createEditor();
 
-/** 已发送过的正文（旧 → 新） */
+/** 上次画在屏幕上的草稿行数（用于上移擦除） */
+let prevDraftLines = 0;
+
+/** >0 时 appendTranscriptBlock 末尾不立刻 refresh（给 onSubmit 等批处理） */
+let draftRefreshBatchDepth = 0;
+
 let submitHistory: string[] = [];
-/** null=编辑新内容；否则为 submitHistory 下标 */
 let historyPos: number | null = null;
-/** Ctrl+C 连按：0 正常；1 已提示再按退出 */
 let ctrlCExitStage = 0;
 
-function pushLog(block: string): void {
-  for (const ln of block.split("\n")) log.push(ln);
-  const max = Math.max(40, termH() * 6);
+function trimLogMemory(): void {
+  const max = Math.max(80, termH() * 8);
   if (log.length > max) log = log.slice(log.length - max);
+}
+
+/** 先擦掉当前草稿，再追加多行正文（像 python / node REPL 一样往下长） */
+function appendTranscriptBlock(block: string): void {
+  const out = process.stdout;
+  if (prevDraftLines > 0) {
+    out.write(`\x1b[${prevDraftLines}A\x1b[0J`);
+    prevDraftLines = 0;
+  }
+  const lines = block.split("\n");
+  for (const ln of lines) {
+    log.push(ln);
+    out.write(ln + ansi.clearLineEnd + "\n");
+  }
+  trimLogMemory();
+  if (draftRefreshBatchDepth === 0) refreshDraft();
+}
+
+function pushLog(block: string): void {
+  appendTranscriptBlock(block);
+}
+
+function beginDraftRefreshBatch(): void {
+  draftRefreshBatchDepth++;
+}
+
+function endDraftRefreshBatch(): void {
+  draftRefreshBatchDepth = Math.max(0, draftRefreshBatchDepth - 1);
+  if (draftRefreshBatchDepth === 0) refreshDraft();
 }
 
 function visualLen(s: string): number {
@@ -33,11 +64,13 @@ function visualLen(s: string): number {
 
 function pushAssistant(block: string): void {
   const parts = block.split("\n");
-  const head = parts[0] ?? "";
-  pushLog(`${ansi.fg(5)}程序${ansi.reset} ${head}`);
+  const lines: string[] = [
+    `${ansi.fg(5)}程序${ansi.reset} ${parts[0] ?? ""}`,
+  ];
   for (let i = 1; i < parts.length; i++) {
-    pushLog(`  ${ansi.dim}${parts[i] ?? ""}${ansi.reset}`);
+    lines.push(`  ${ansi.dim}${parts[i] ?? ""}${ansi.reset}`);
   }
+  pushLog(lines.join("\n"));
 }
 
 function handleCommand(text: string): void {
@@ -52,9 +85,9 @@ function handleCommand(text: string): void {
         `  demo 256        256 色条`,
         `  demo truecolor  24bit 渐变`,
         `  demo styles     粗体/斜体/下划线/反显等`,
-        `  demo cursor     光标移动演示`,
-        `  clear           清空对话记录`,
-        `  （编辑）首行↑/末行↓ 切上一条/下一条历史；Ctrl+C 清空，空时连按提示后退出`,
+        `  demo cursor     滚动与草稿重绘说明`,
+        `  clear           清空对话记录（仅内存）`,
+        `  （编辑）首行↑/末行↓ 历史；Ctrl+C 清空草稿，空时再按提示退出`,
         "",
       ].join("\n"),
     );
@@ -62,7 +95,7 @@ function handleCommand(text: string): void {
   }
   if (lower === "clear") {
     log = [];
-    pushLog(`${ansi.dim}对话已清空${ansi.reset}`);
+    pushLog(`${ansi.dim}—— 对话记录已清空（内存；上方终端历史仍在）——${ansi.reset}`);
     return;
   }
   if (lower === "demo sgr") {
@@ -99,8 +132,8 @@ function handleCommand(text: string): void {
   if (lower === "demo cursor") {
     pushAssistant(
       [
-        `${ansi.bold}光标定位${ansi.reset}：ANSI 序列 ${ansi.dim}CSI row;col H${ansi.reset}（本程序里即 \\x1b[row;colH）。`,
-        `单流对话：${ansi.dim}log + 当前草稿${ansi.reset} 合成一列，自下而上滚动；光标只在草稿行。`,
+        `${ansi.bold}REPL 式滚动${ansi.reset}：不启用备用屏、不用 \\x1b[2J 清整屏；正文用普通换行往下长。`,
+        `多行草稿：${ansi.dim}每次按键先把光标上移 prevDraftLines 行，\\x1b[0J 从该处清到屏幕末，再重画草稿行。${ansi.reset}`,
       ].join("\n"),
     );
     return;
@@ -112,68 +145,52 @@ function handleCommand(text: string): void {
   );
 }
 
-/** 当前草稿行并入对话流（前缀两列：光标行 `>`，其余 `·`） */
+/** 草稿行：纯 ASCII 前缀，便于算光标列（与 python 提示符类似） */
 function draftLinesForStream(): string[] {
   return editor.lines.map((row, i) => {
-    const mark =
-      i === editor.cur.line
-        ? `${ansi.fg(4)}>${ansi.reset}`
-        : `${ansi.dim}·${ansi.reset}`;
-    return `${mark} ${row}`;
+    const mark = i === editor.cur.line ? "> " : "· ";
+    return `${mark}${row}`;
   });
 }
 
-function redraw(): void {
+function placeDraftCursor(nLines: number, cy: number, cx: number, rowStr: string): void {
+  const out = process.stdout;
   const w = termW();
-  const h = termH();
-  const headerRows = 1;
-  const bodyH = Math.max(3, h - headerRows);
+  const up = nLines - cy;
+  out.write(`\x1b[${up}A\r`);
+  const v = Math.min(visualLen(rowStr.slice(0, cx)), Math.max(0, w - 4));
+  const col1 = 3 + v;
+  if (col1 > 1) out.write(`\x1b[${col1 - 1}C`);
+}
 
-  const buf = editor.lines;
+function refreshDraft(): void {
+  const out = process.stdout;
+  const lines = draftLinesForStream();
+  const n = lines.length;
   const cy = editor.cur.line;
   const cx = editor.cur.col;
+  const rowStr = editor.lines[cy] ?? "";
 
-  const draftVis = draftLinesForStream();
-  const merged: string[] = [...log, ...draftVis];
-  const cursorMerged = log.length + cy;
-
-  let start = Math.max(0, merged.length - bodyH);
-  if (cursorMerged < start) start = cursorMerged;
-  if (cursorMerged >= start + bodyH) start = cursorMerged - bodyH + 1;
-  start = Math.max(0, Math.min(start, Math.max(0, merged.length - bodyH)));
-
-  const slice = merged.slice(start, start + bodyH);
-  const padTop = bodyH - slice.length;
-  const vis: string[] = [...Array.from({ length: padTop }, () => ""), ...slice];
-
-  let s = ansi.hideCursor + ansi.home + ansi.clearScreen;
-
-  s += `${ansi.bold}${ansi.fg(4)}对话式 TTY${ansi.reset} ${ansi.dim}Enter 发送 · Shift+Enter 换行 · help · 首行↑/末行↓ 历史 · Ctrl+C 清空→空时再按退出${ansi.reset}${ansi.clearLineEnd}\n`;
-
-  for (const line of vis) {
-    s += line + ansi.clearLineEnd + "\n";
+  out.write(ansi.hideCursor);
+  if (prevDraftLines > 0) {
+    out.write(`\x1b[${prevDraftLines}A\x1b[0J`);
   }
-
-  const rel = padTop + (cursorMerged - start);
-  const cursorRow = headerRows + 1 + rel;
-  const rowStr = buf[cy] ?? "";
-  const sliceLeft = rowStr.slice(0, cx);
-  const prefixCols = 3;
-  let col = prefixCols + Math.min(visualLen(sliceLeft), w - prefixCols);
-  if (col < prefixCols) col = prefixCols;
-  if (col > w) col = w;
-
-  s += ansi.moveTo(cursorRow, col) + ansi.showCursor;
-  process.stdout.write(s);
+  for (const line of lines) {
+    out.write(line + ansi.clearLineEnd + "\n");
+  }
+  prevDraftLines = n;
+  placeDraftCursor(n, cy, cx, rowStr);
+  out.write(ansi.showCursor);
 }
 
 function pushUserTurn(text: string): void {
   const parts = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
   const head = parts[0] ?? "";
-  pushLog(`${ansi.bold}你${ansi.reset} ${head}`);
+  const lines: string[] = [`${ansi.bold}你${ansi.reset} ${head}`];
   for (let i = 1; i < parts.length; i++) {
-    pushLog(`${ansi.dim}  ${parts[i] ?? ""}${ansi.reset}`);
+    lines.push(`${ansi.dim}  ${parts[i] ?? ""}${ansi.reset}`);
   }
+  pushLog(lines.join("\n"));
 }
 
 function onSubmit(): void {
@@ -181,16 +198,17 @@ function onSubmit(): void {
   if (!text.trim()) {
     editor.resetAfterSubmit();
     historyPos = null;
-    redraw();
+    refreshDraft();
     return;
   }
   submitHistory.push(text);
   historyPos = null;
   ctrlCExitStage = 0;
+  beginDraftRefreshBatch();
   pushUserTurn(text);
   handleCommand(text);
   editor.resetAfterSubmit();
-  redraw();
+  endDraftRefreshBatch();
 }
 
 function inputHasChars(): boolean {
@@ -210,13 +228,12 @@ function noteBufferMutation(): void {
   leaveHistoryBrowse();
 }
 
-/** Ctrl+C：仅在 keypress 里处理；另挂空 SIGINT 防止 Node 默认直接退出 */
 function handleCtrlC(): void {
   if (inputHasChars()) {
     editor.clear();
     resetExitHint();
     leaveHistoryBrowse();
-    redraw();
+    refreshDraft();
     return;
   }
   if (ctrlCExitStage === 0) {
@@ -224,7 +241,6 @@ function handleCtrlC(): void {
     pushLog(
       `${ansi.fg(1)}Ctrl+C${ansi.reset}：${ansi.bold}再按一次 Ctrl+C 将退出程序。${ansi.reset}`,
     );
-    redraw();
     return;
   }
   cleanup();
@@ -340,7 +356,7 @@ function handleKey(_str: string | undefined, key: Key): boolean {
 function cleanup(): void {
   process.stdin.setRawMode(false);
   process.stdin.pause();
-  process.stdout.write(ansi.showCursor + ansi.altScreenOff + ansi.reset + "\n");
+  process.stdout.write(ansi.showCursor + ansi.reset + "\n");
 }
 
 function main(): void {
@@ -351,23 +367,22 @@ function main(): void {
 
   readline.emitKeypressEvents(process.stdin);
   process.stdin.setRawMode(true);
-  process.stdout.write(ansi.altScreenOn);
   process.on("SIGINT", () => {});
 
-  pushLog(`${ansi.fg(3)}就绪。${ansi.reset} 输入 ${ansi.bold}help${ansi.reset} 查看命令。`);
-  redraw();
+  pushLog(
+    `${ansi.dim}──${ansi.reset} ${ansi.bold}对话式 TTY${ansi.reset} ${ansi.dim}Enter 发送 · Shift+Enter 换行 · help · 首行↑/末行↓ 历史 · Ctrl+C 清空草稿；空时再按退出${ansi.reset}`,
+  );
+  pushLog(
+    `${ansi.fg(3)}就绪。${ansi.reset} 输入 ${ansi.bold}help${ansi.reset} 查看命令。（不抢备用屏、不清整屏）`,
+  );
 
   process.stdin.on("keypress", (str, key) => {
     if (!key) return;
-    const cont = handleKey(str, key);
-    if (!cont) {
-      cleanup();
-      process.exit(0);
-    }
-    redraw();
+    handleKey(str, key);
+    refreshDraft();
   });
 
-  process.stdout.on("resize", () => redraw());
+  process.stdout.on("resize", () => refreshDraft());
 }
 
 main();
