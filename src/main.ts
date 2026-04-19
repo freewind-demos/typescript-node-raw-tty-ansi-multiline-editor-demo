@@ -4,238 +4,355 @@ import type { Key } from "node:readline";
 import * as ansi from "./ansi.js";
 import { createEditor } from "./editor.js";
 
-const termW = () => process.stdout.columns ?? 80;
-const termH = () => process.stdout.rows ?? 24;
+type Block =
+  | { kind: "user"; lines: string[] }
+  | { kind: "assistant"; lines: string[] }
+  | { kind: "system"; lines: string[] }
+  | { kind: "diff"; title: string; lines: string[] }
+  | { kind: "palette"; title: string; lines: string[] }
+  | { kind: "code"; title: string; lines: string[] };
 
-type LogLine = string;
+type FooterModel = {
+  lines: string[];
+  cursorLineIndex: number;
+  cursorCol: number;
+};
 
-let log: LogLine[] = [];
 const editor = createEditor();
+const transcript: Block[] = [];
+const submitHistory: string[] = [];
 
-/** 上次画在屏幕上的草稿行数（用于上移擦除） */
-let prevDraftLines = 0;
+const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/**
- * placeDraftCursor 会把光标移进草稿行；下次若仍从「行内」做 nA，会误进 transcript 被 0J 吃掉。
- * 在草稿最后一行之下用 \\x1b[s 存锚点，重画/插正文前 \\x1b[u 回到该点再 nA。
- */
-let draftAnchorSaved = false;
-
-/** >0 时 appendTranscriptBlock 末尾不立刻 refresh（给 onSubmit 等批处理） */
-let draftRefreshBatchDepth = 0;
-
-let submitHistory: string[] = [];
 let historyPos: number | null = null;
-let ctrlCExitStage = 0;
+let historyDraft = "";
+let ctrlCExitArmed = false;
+let spinnerIndex = 0;
+let spinnerTimer: NodeJS.Timeout | null = null;
+let typingDots = 0;
+let typingLastActivityAt = 0;
+let typingTimer: NodeJS.Timeout | null = null;
+let pending = false;
+let pendingQueue = 0;
+let prevFooterLines = 0;
+let footerAnchorSaved = false;
+let isShuttingDown = false;
 
-function trimLogMemory(): void {
-  const max = Math.max(80, termH() * 8);
-  if (log.length > max) log = log.slice(log.length - max);
+function termW(): number {
+  return Math.max(40, process.stdout.columns ?? 80);
 }
 
-/** 回到「草稿块起点」再擦掉草稿（光标须在块下或已 u 回锚点） */
-function moveToDraftEraseAnchor(): void {
-  const out = process.stdout;
-  if (draftAnchorSaved) out.write("\x1b[u");
-  if (prevDraftLines > 0) {
-    out.write(`\x1b[${prevDraftLines}A\x1b[0J`);
-    prevDraftLines = 0;
+function termH(): number {
+  return Math.max(12, process.stdout.rows ?? 24);
+}
+
+function visualWidth(text: string): number {
+  let width = 0;
+  for (const ch of text) width += /[\u0000-\u007f]/.test(ch) ? 1 : 2;
+  return width;
+}
+
+function fitPlain(text: string, maxWidth: number): string {
+  if (maxWidth <= 0) return "";
+  let out = "";
+  let used = 0;
+  for (const ch of text) {
+    const w = /[\u0000-\u007f]/.test(ch) ? 1 : 2;
+    if (used + w > maxWidth) break;
+    out += ch;
+    used += w;
   }
+  return out;
 }
 
-/** 先擦掉当前草稿，再追加多行正文（像 python / node REPL 一样往下长） */
-function appendTranscriptBlock(block: string): void {
-  const out = process.stdout;
-  moveToDraftEraseAnchor();
-  const lines = block.split("\n");
-  for (const ln of lines) {
-    log.push(ln);
-    out.write(ln + ansi.clearLineEnd + "\n");
-  }
-  trimLogMemory();
-  draftAnchorSaved = false;
-  if (draftRefreshBatchDepth === 0) refreshDraft();
-}
-
-function pushLog(block: string): void {
-  appendTranscriptBlock(block);
-}
-
-function beginDraftRefreshBatch(): void {
-  draftRefreshBatchDepth++;
-}
-
-function endDraftRefreshBatch(): void {
-  draftRefreshBatchDepth = Math.max(0, draftRefreshBatchDepth - 1);
-  if (draftRefreshBatchDepth === 0) refreshDraft();
-}
-
-function visualLen(s: string): number {
-  let v = 0;
-  for (const ch of s) v += /[\u0000-\u007f]/.test(ch) ? 1 : 2;
-  return v;
-}
-
-function pushAssistant(block: string): void {
-  const parts = block.split("\n");
-  const lines: string[] = [
-    `${ansi.fg(5)}程序${ansi.reset} ${parts[0] ?? ""}`,
-  ];
-  for (let i = 1; i < parts.length; i++) {
-    lines.push(`  ${ansi.dim}${parts[i] ?? ""}${ansi.reset}`);
-  }
-  pushLog(lines.join("\n"));
-}
-
-function handleCommand(text: string): void {
-  const t = text.trim();
-  const lower = t.toLowerCase();
-  if (lower === "help" || lower === "?") {
-    pushAssistant(
-      [
-        `${ansi.bold}可用命令${ansi.reset}（整段发送，可多行）：`,
-        `  help / ?        本说明`,
-        `  demo sgr        16 色 + 基本 SGR`,
-        `  demo 256        256 色条`,
-        `  demo truecolor  24bit 渐变`,
-        `  demo styles     粗体/斜体/下划线/反显等`,
-        `  demo cursor     滚动与草稿重绘说明`,
-        `  clear           清空对话记录（仅内存）`,
-        `  Shift+Enter    插入换行；Enter 发送整段`,
-        `  （编辑）首行↑/末行↓ 历史；Ctrl+C 清空草稿，空时再按提示退出`,
-        "",
-      ].join("\n"),
-    );
-    return;
-  }
-  if (lower === "clear") {
-    log = [];
-    pushLog(`${ansi.dim}—— 对话记录已清空（内存；上方终端历史仍在）——${ansi.reset}`);
-    return;
-  }
-  if (lower === "demo sgr") {
-    const row = Array.from({ length: 8 }, (_, i) => `${ansi.fg(i as 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7)}█${ansi.reset}`).join(
-      "",
-    );
-    pushAssistant(`${ansi.bold}前景 30–37${ansi.reset}\n${row}`);
-    return;
-  }
-  if (lower === "demo 256") {
-    let s = `${ansi.bold}256 色（38;5;n）${ansi.reset}\n`;
-    for (let i = 16; i < 52; i++) s += ansi.fg256(i) + "█" + ansi.reset;
-    pushAssistant(s);
-    return;
-  }
-  if (lower === "demo truecolor") {
-    let s = `${ansi.bold}24bit（38;2;r;g;b）${ansi.reset}\n`;
-    for (let x = 0; x < 48; x++) {
-      const r = Math.round((x / 47) * 255);
-      s += ansi.fgTrue(r, 80, 200) + "▓" + ansi.reset;
+function wrapPlain(text: string, maxWidth: number): string[] {
+  if (maxWidth <= 0) return [""];
+  if (!text.length) return [""];
+  const out: string[] = [];
+  let row = "";
+  let used = 0;
+  for (const ch of text) {
+    const w = /[\u0000-\u007f]/.test(ch) ? 1 : 2;
+    if (used + w > maxWidth) {
+      out.push(row);
+      row = ch;
+      used = w;
+      continue;
     }
-    pushAssistant(s);
-    return;
+    row += ch;
+    used += w;
   }
-  if (lower === "demo styles") {
-    pushAssistant(
-      [
-        `${ansi.bold}bold${ansi.reset}  ${ansi.dim}dim${ansi.reset}  ${ansi.italic}italic${ansi.reset}  ${ansi.underline}underline${ansi.reset}`,
-        `${ansi.strikethrough}strikethrough${ansi.reset}  ${ansi.inverse}inverse${ansi.reset}${ansi.reset}`,
-      ].join("\n"),
-    );
-    return;
-  }
-  if (lower === "demo cursor") {
-    pushAssistant(
-      [
-        `${ansi.bold}REPL 式滚动${ansi.reset}：不启用备用屏、不用 \\x1b[2J 清整屏；正文用普通换行往下长。`,
-        `多行草稿：${ansi.dim}每次先 \\x1b[u 回到草稿块下的锚点（\\x1b[s 存的），再 nA+\\x1b[0J 擦掉草稿，避免从行内 nA 误伤上面的 transcript。${ansi.reset}`,
-      ].join("\n"),
-    );
-    return;
-  }
-  const lines = text.split("\n").length;
-  const chars = [...text].length;
-  pushAssistant(
-    `${ansi.fg(6)}回显${ansi.reset} 行=${lines} 字=${chars}\n${ansi.dim}${text.replaceAll("\n", "↵ ")}${ansi.reset}`,
-  );
+  out.push(row);
+  return out;
 }
 
-/** 草稿行：纯 ASCII 前缀，便于算光标列（与 python 提示符类似） */
-function draftLinesForStream(): string[] {
-  return editor.lines.map((row, i) => {
-    const mark = i === editor.cur.line ? "> " : "· ";
-    return `${mark}${row}`;
+function paintLine(text: string, fg = "", bg = ""): string {
+  const width = termW();
+  const body = fitPlain(text, width);
+  const pad = Math.max(0, width - visualWidth(body));
+  return `${bg}${fg}${body}${" ".repeat(pad)}${ansi.reset}`;
+}
+
+function renderBubble(
+  lines: string[],
+  theme: { bodyBg: string; bodyFg: string },
+): string[] {
+  const width = termW();
+  const prefix = "• ";
+  const bodyWidth = Math.max(8, width - 4 - visualWidth(prefix));
+  const out: string[] = [];
+  for (const line of lines) {
+    for (const part of wrapPlain(line, bodyWidth)) {
+      out.push(paintLine(`  ${prefix}${part}`, theme.bodyFg, theme.bodyBg));
+    }
+  }
+  return out;
+}
+
+function renderUserBox(lines: string[]): string[] {
+  const width = termW();
+  const innerWidth = Math.max(8, width - 6);
+  const topBottom = "-".repeat(innerWidth + 2);
+  const out = [`${ansi.fg256(244)}  +${topBottom}+${ansi.reset}${ansi.clearLineEnd}`];
+  for (const line of lines) {
+    for (const part of wrapPlain(line, innerWidth)) {
+      const pad = Math.max(0, innerWidth - visualWidth(part));
+      out.push(
+        `${ansi.fg256(244)}  |${ansi.reset}${ansi.fg256(239)} ${part}${" ".repeat(pad)} ${ansi.reset}${ansi.fg256(244)}|${ansi.reset}${ansi.clearLineEnd}`,
+      );
+    }
+  }
+  out.push(`${ansi.fg256(244)}  +${topBottom}+${ansi.reset}${ansi.clearLineEnd}`);
+  return out;
+}
+
+function renderSystem(lines: string[]): string[] {
+  return lines.map((line) => paintLine(`  ${line}`, ansi.fg256(245)));
+}
+
+function renderPalette(title: string, lines: string[]): string[] {
+  return [paintLine(`  ${ansi.fg(2)}${title}${ansi.reset}`), ...lines];
+}
+
+function renderCode(title: string, lines: string[]): string[] {
+  const out = [paintLine(`  ${ansi.fg(2)}${title}${ansi.reset}`)];
+  for (const line of lines) out.push(paintLine(`    ${line}`, ansi.fg256(250)));
+  return out;
+}
+
+function renderDiff(title: string, lines: string[]): string[] {
+  const out = [paintLine(`  ${ansi.fg(2)}${title}${ansi.reset}`)];
+  for (const line of lines) {
+    let fg = ansi.fg256(250);
+    let bg = "";
+    if (line.startsWith("@@")) {
+      fg = ansi.fg256(117);
+    } else if (line.startsWith("+")) {
+      fg = ansi.fg256(158);
+    } else if (line.startsWith("-")) {
+      fg = ansi.fg256(224);
+    } else if (
+      line.startsWith("diff --git") ||
+      line.startsWith("index ") ||
+      line.startsWith("---") ||
+      line.startsWith("+++")
+    ) {
+      fg = ansi.fg256(222);
+    }
+    out.push(paintLine(`    ${line}`, fg, bg));
+  }
+  return out;
+}
+
+function renderBlock(block: Block): string[] {
+  if (block.kind === "user") {
+    return renderUserBox(block.lines);
+  }
+  if (block.kind === "assistant") {
+    return renderBubble(block.lines, {
+      bodyBg: "",
+      bodyFg: ansi.fg256(250),
+    });
+  }
+  if (block.kind === "system") return renderSystem(block.lines);
+  if (block.kind === "diff") return renderDiff(block.title, block.lines);
+  if (block.kind === "palette") return renderPalette(block.title, block.lines);
+  return renderCode(block.title, block.lines);
+}
+
+function trimTranscript(): void {
+  const maxBlocks = Math.max(30, termH() * 3);
+  if (transcript.length > maxBlocks) transcript.splice(0, transcript.length - maxBlocks);
+}
+
+function eraseFooter(): void {
+  const out = process.stdout;
+  if (footerAnchorSaved) out.write("\x1b[u");
+  if (prevFooterLines > 0) {
+    out.write(`\x1b[${prevFooterLines}A\x1b[0J`);
+    prevFooterLines = 0;
+  }
+}
+
+function footerStatusText(): string {
+  if (pending) {
+    const frame = spinnerFrames[spinnerIndex % spinnerFrames.length] ?? spinnerFrames[0]!;
+    const queued = pendingQueue > 0 ? ` · 队列 ${pendingQueue}` : "";
+    return `${frame} assistant thinking… 1s mock latency${queued}`;
+  }
+  return "Enter 发送 · Shift+Enter 换行 · ↑↓ 首尾切历史 · Ctrl+C 清空/退出";
+}
+
+function isTypingActive(): boolean {
+  return editor.getText().length > 0 && Date.now() - typingLastActivityAt < 1000;
+}
+
+function typingIndicator(): string {
+  const frames = ["-", "\\", "|", "/"];
+  return frames[typingDots % frames.length] ?? frames[0]!;
+}
+
+function ensureTypingTimer(): void {
+  if (typingTimer) return;
+  typingTimer = setInterval(() => {
+    if (!isTypingActive()) {
+      if (typingTimer) clearInterval(typingTimer);
+      typingTimer = null;
+      refreshFooter();
+      return;
+    }
+    typingDots++;
+    refreshFooter();
+  }, 300);
+}
+
+function markTypingActivity(): void {
+  typingLastActivityAt = Date.now();
+  typingDots = (typingDots + 1) % 4;
+  ensureTypingTimer();
+}
+
+function stopTypingIndicator(): void {
+  typingLastActivityAt = 0;
+  typingDots = 0;
+  if (typingTimer) clearInterval(typingTimer);
+  typingTimer = null;
+}
+
+function renderFooter(): FooterModel {
+  const width = termW();
+  const lines: string[] = [];
+  const showTyping = isTypingActive();
+  const metaCount = (pending ? 1 : 0) + 1;
+
+  if (pending) lines.push(paintLine(` ${footerStatusText()}`, ansi.fg256(230), ansi.bg256(60)));
+  const typing = showTyping ? `   ${typingIndicator()}` : "";
+  lines.push(
+    paintLine(
+      ` 行 ${editor.cur.line + 1}/${editor.lines.length} · 列 ${editor.cur.col + 1} · 历史 ${submitHistory.length}${typing}`,
+      ansi.fg256(245),
+    ),
+  );
+
+  const idlePrefix = ". ";
+  const activePrefix = "> ";
+  const contentMax = Math.max(8, width - visualWidth(activePrefix));
+
+  for (let i = 0; i < editor.lines.length; i++) {
+    const prefix = i === editor.cur.line ? activePrefix : idlePrefix;
+    const text = fitPlain(editor.lines[i] ?? "", contentMax);
+    lines.push(paintLine(`${prefix}${text}`, ansi.fg256(235), ansi.bg256(254)));
+  }
+
+  const activeLine = editor.lines[editor.cur.line] ?? "";
+  const left = fitPlain(activeLine.slice(0, editor.cur.col), contentMax);
+  const cursorCol = Math.min(width, visualWidth(activePrefix) + visualWidth(left) + 1);
+
+  return {
+    lines,
+    cursorLineIndex: metaCount + editor.cur.line,
+    cursorCol,
+  };
+}
+
+function placeFooterCursor(model: FooterModel): void {
+  const up = model.lines.length - model.cursorLineIndex;
+  process.stdout.write(`\x1b[${up}A\r`);
+  if (model.cursorCol > 1) process.stdout.write(`\x1b[${model.cursorCol - 1}C`);
+}
+
+function refreshFooter(): void {
+  if (isShuttingDown) return;
+  const out = process.stdout;
+  const model = renderFooter();
+
+  out.write(ansi.hideCursor);
+  eraseFooter();
+  for (const line of model.lines) out.write(line + ansi.clearLineEnd + "\n");
+  prevFooterLines = model.lines.length;
+  out.write("\x1b[s");
+  placeFooterCursor(model);
+  out.write(ansi.showCursor);
+  footerAnchorSaved = true;
+}
+
+function rerenderAll(): void {
+  if (isShuttingDown) return;
+  const out = process.stdout;
+  out.write(ansi.hideCursor + ansi.home + "\x1b[0J");
+  for (const block of transcript) {
+    for (const line of renderBlock(block)) out.write(line + ansi.clearLineEnd + "\n");
+  }
+  prevFooterLines = 0;
+  footerAnchorSaved = false;
+  refreshFooter();
+}
+
+function appendBlock(block: Block): void {
+  const out = process.stdout;
+  transcript.push(block);
+  trimTranscript();
+  out.write(ansi.hideCursor);
+  eraseFooter();
+  for (const line of renderBlock(block)) out.write(line + ansi.clearLineEnd + "\n");
+  footerAnchorSaved = false;
+  refreshFooter();
+}
+
+function pushSystem(...lines: string[]): void {
+  appendBlock({ kind: "system", lines });
+}
+
+function pushUser(text: string): void {
+  appendBlock({
+    kind: "user",
+    lines: text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n"),
   });
 }
 
-function placeDraftCursor(nLines: number, cy: number, cx: number, rowStr: string): void {
-  const out = process.stdout;
-  const w = termW();
-  const up = nLines - cy;
-  out.write(`\x1b[${up}A\r`);
-  const v = Math.min(visualLen(rowStr.slice(0, cx)), Math.max(0, w - 4));
-  const col1 = 3 + v;
-  if (col1 > 1) out.write(`\x1b[${col1 - 1}C`);
+function pushAssistant(...lines: string[]): void {
+  appendBlock({ kind: "assistant", lines });
 }
 
-function refreshDraft(): void {
-  const out = process.stdout;
-  const lines = draftLinesForStream();
-  const n = lines.length;
-  const cy = editor.cur.line;
-  const cx = editor.cur.col;
-  const rowStr = editor.lines[cy] ?? "";
-
-  out.write(ansi.hideCursor);
-  moveToDraftEraseAnchor();
-  for (const line of lines) {
-    out.write(line + ansi.clearLineEnd + "\n");
-  }
-  prevDraftLines = n;
-  out.write("\x1b[s");
-  placeDraftCursor(n, cy, cx, rowStr);
-  out.write(ansi.showCursor);
-  draftAnchorSaved = true;
+function pushDiff(title: string, lines: string[]): void {
+  appendBlock({ kind: "diff", title, lines });
 }
 
-function pushUserTurn(text: string): void {
-  const parts = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-  const head = parts[0] ?? "";
-  const lines: string[] = [`${ansi.bold}你${ansi.reset} ${head}`];
-  for (let i = 1; i < parts.length; i++) {
-    lines.push(`${ansi.dim}  ${parts[i] ?? ""}${ansi.reset}`);
-  }
-  pushLog(lines.join("\n"));
+function pushPalette(title: string, lines: string[]): void {
+  appendBlock({ kind: "palette", title, lines });
 }
 
-function onSubmit(): void {
-  const text = editor.getText();
-  if (!text.trim()) {
-    editor.resetAfterSubmit();
-    historyPos = null;
-    refreshDraft();
-    return;
-  }
-  submitHistory.push(text);
-  historyPos = null;
-  ctrlCExitStage = 0;
-  beginDraftRefreshBatch();
-  pushUserTurn(text);
-  handleCommand(text);
-  editor.resetAfterSubmit();
-  endDraftRefreshBatch();
-}
-
-function inputHasChars(): boolean {
-  return editor.getText().length > 0;
+function pushCode(title: string, lines: string[]): void {
+  appendBlock({ kind: "code", title, lines });
 }
 
 function resetExitHint(): void {
-  ctrlCExitStage = 0;
+  ctrlCExitArmed = false;
 }
 
 function leaveHistoryBrowse(): void {
   historyPos = null;
+  historyDraft = "";
 }
 
 function noteBufferMutation(): void {
@@ -243,28 +360,10 @@ function noteBufferMutation(): void {
   leaveHistoryBrowse();
 }
 
-function handleCtrlC(): void {
-  if (inputHasChars()) {
-    editor.clear();
-    resetExitHint();
-    leaveHistoryBrowse();
-    refreshDraft();
-    return;
-  }
-  if (ctrlCExitStage === 0) {
-    ctrlCExitStage = 1;
-    pushLog(
-      `${ansi.fg(1)}Ctrl+C${ansi.reset}：${ansi.bold}再按一次 Ctrl+C 将退出程序。${ansi.reset}`,
-    );
-    return;
-  }
-  cleanup();
-  process.exit(0);
-}
-
 function historyPrev(): void {
   if (submitHistory.length === 0) return;
   if (historyPos === null) {
+    historyDraft = editor.getText();
     historyPos = submitHistory.length - 1;
   } else if (historyPos > 0) {
     historyPos--;
@@ -279,117 +378,389 @@ function historyNext(): void {
   if (historyPos === null) return;
   if (historyPos < submitHistory.length - 1) {
     historyPos++;
-    resetExitHint();
     editor.loadFromString(submitHistory[historyPos] ?? "");
-    return;
+  } else {
+    historyPos = null;
+    editor.loadFromString(historyDraft);
+    historyDraft = "";
   }
-  historyPos = null;
   resetExitHint();
-  editor.clear();
 }
 
-/** 多终端下 Shift+Enter 不一定带 key.shift；常见为 CSI + CR/LF */
-function wantsSoftNewline(key: Key): boolean {
-  if (key.shift) return true;
+function handleCtrlC(): void {
+  if (editor.getText().length > 0) {
+    editor.clear();
+    stopTypingIndicator();
+    leaveHistoryBrowse();
+    resetExitHint();
+    refreshFooter();
+    return;
+  }
+
+  if (!ctrlCExitArmed) {
+    ctrlCExitArmed = true;
+    pushSystem("Ctrl+C 再按一次退出。当前草稿为空。");
+    return;
+  }
+
+  cleanup();
+  process.exit(0);
+}
+
+function startSpinner(): void {
+  pending = true;
+  spinnerIndex = 0;
+  if (spinnerTimer) clearInterval(spinnerTimer);
+  spinnerTimer = setInterval(() => {
+    spinnerIndex++;
+    refreshFooter();
+  }, 80);
+}
+
+function stopSpinner(): void {
+  pending = false;
+  if (spinnerTimer) clearInterval(spinnerTimer);
+  spinnerTimer = null;
+}
+
+function renderPaletteDemo(): void {
+  const basic = Array.from({ length: 8 }, (_, i) => `${ansi.bg(i as 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7)}  ${ansi.reset}`).join(" ");
+  const vivid = Array.from({ length: 12 }, (_, i) => `${ansi.bg256(20 + i * 12)}  ${ansi.reset}`).join(" ");
+  const gradient = Array.from({ length: 24 }, (_, i) => {
+    const r = Math.round((i / 23) * 255);
+    const g = 120;
+    const b = 255 - r;
+    return `${ansi.bgTrue(r, g, b)} ${ansi.reset}`;
+  }).join("");
+
+  pushAssistant("收到 demo", "下面三行分别是 16 色、256 色、truecolor 渐变。");
+  pushPalette("Palette", [basic, vivid, gradient]);
+}
+
+function renderPatchDemo(): void {
+  pushAssistant(
+    "收到 demo",
+    "终端里最常见展示之一就是 patch。这里把文件头、hunk、增删行做分色。",
+    "这个版本是单流往下长，输入区始终贴在最底下。"
+  );
+  pushDiff("git diff -- src/chat.ts", [
+    "diff --git a/src/chat.ts b/src/chat.ts",
+    "index 8d1a4f1..e3a7c42 100644",
+    "--- a/src/chat.ts",
+    "+++ b/src/chat.ts",
+    "@@ -12,7 +12,11 @@ export function sendMessage(text: string) {",
+    '-  socket.write(JSON.stringify({ text }));',
+    '+  socket.write(JSON.stringify({',
+    '+    text,',
+    '+    sentAt: new Date().toISOString(),',
+    '+  }));',
+    "   pendingCount++;",
+    "@@ -28,6 +32,7 @@ export function renderFooter() {",
+    '+  showSpinner("assistant thinking");',
+    "   showPrompt();",
+    " }",
+  ]);
+}
+
+function renderCodeDemo(): void {
+  pushAssistant("收到 demo", "代码块也按顺序插进 transcript，不会固定在屏幕某一块。");
+  pushCode("src/editor.ts", [
+    "function moveUp() {",
+    "  // 到顶时切历史，而不是继续卡住",
+    "  if (cursor.line === 0) historyPrev();",
+    "  else cursor.line--;",
+    "}",
+  ]);
+}
+
+function handleCommand(text: string): void {
+  const trimmed = text.trim();
+  const lower = trimmed.toLowerCase();
+  const cmd = (s: string) => `${ansi.fg(2)}${s}${ansi.reset}`;
+  const received = `${ansi.fg(6)}收到消息${ansi.reset}`;
+
+  if (!trimmed) return;
+
+  if (lower === "help" || lower === "?") {
+    pushAssistant(
+      `内置命令：${cmd("help")} ${cmd("clear")} ${cmd("demo all")} ${cmd("demo colors")} ${cmd("demo patch")} ${cmd("demo code")} ${cmd("demo status")}`
+    );
+    return;
+  }
+
+  if (lower === "clear") {
+    transcript.length = 0;
+    rerenderAll();
+    pushSystem("对话区已清空。");
+    return;
+  }
+
+  if (lower === "demo colors") {
+    renderPaletteDemo();
+    return;
+  }
+
+  if (lower === "demo patch" || lower === "demo diff") {
+    renderPatchDemo();
+    return;
+  }
+
+  if (lower === "demo code") {
+    renderCodeDemo();
+    return;
+  }
+
+  if (lower === "demo status") {
+    pushAssistant("收到 demo", "发送后先出现 spinner，再补出回复。");
+    return;
+  }
+
+  if (lower === "demo all") {
+    pushAssistant("收到 demo", "发送后先出现 spinner，再补出回复。");
+    renderPaletteDemo();
+    renderPatchDemo();
+    renderCodeDemo();
+    return;
+  }
+
+  if (lower.includes("patch") || lower.includes("diff")) {
+    pushAssistant("收到 demo");
+    renderPatchDemo();
+    return;
+  }
+
+  if (lower.includes("颜色") || lower.includes("color")) {
+    pushAssistant("收到 demo");
+    renderPaletteDemo();
+    return;
+  }
+
+  pushAssistant(`${received} ${text.replaceAll("\n", " ↵ ")}`);
+}
+
+async function simulateAssistantResponse(text: string): Promise<void> {
+  pendingQueue = Math.max(0, pendingQueue - 1);
+  startSpinner();
+  refreshFooter();
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  stopSpinner();
+  handleCommand(text);
+  refreshFooter();
+}
+
+function enqueueResponse(text: string): void {
+  pendingQueue++;
+  if (pending) {
+    refreshFooter();
+    void waitForQueue(text);
+    return;
+  }
+  void simulateAssistantResponse(text);
+}
+
+async function waitForQueue(text: string): Promise<void> {
+  while (pending) {
+    await new Promise((resolve) => setTimeout(resolve, 80));
+  }
+  await simulateAssistantResponse(text);
+}
+
+function onSubmit(): void {
+  const text = editor.getText();
+  if (!text.trim()) {
+    editor.resetAfterSubmit();
+    stopTypingIndicator();
+    leaveHistoryBrowse();
+    refreshFooter();
+    return;
+  }
+
+  submitHistory.push(text);
+  editor.resetAfterSubmit();
+  stopTypingIndicator();
+  leaveHistoryBrowse();
+  resetExitHint();
+  pushUser(text);
+  enqueueResponse(text);
+}
+
+function wantsSoftNewline(str: string | undefined, key: Key): boolean {
+  if ((key.name === "return" || key.name === "enter") && key.shift) return true;
+
+  if (
+    str === "\n" ||
+    str === "\x1b\r" ||
+    str === "\x1b[13;2u" ||
+    str === "\x1b[27;2;13~"
+  ) {
+    return true;
+  }
+
   const s = key.sequence ?? "";
+  if (
+    s === "\n" ||
+    s === "\x1b\r" ||
+    s === "\x1b[13;2u" ||
+    s === "\x1b[27;2;13~"
+  ) {
+    return true;
+  }
+
   if ((key.name === "return" || key.name === "enter") && s.startsWith("\x1b")) return true;
   return false;
 }
 
-/** 未解析成 return，但整段是「修饰键 + 换行」时避免 insertText 把 ESC 当字符写进去 */
-function looksLikeModifiedEnterSequence(key: Key): boolean {
+function looksLikeModifiedEnterSequence(str: string | undefined, key: Key): boolean {
   if (key.ctrl) return false;
+  if (
+    str === "\n" ||
+    str === "\x1b\r" ||
+    str === "\x1b[13;2u" ||
+    str === "\x1b[27;2;13~"
+  ) {
+    return true;
+  }
   const s = key.sequence ?? "";
-  if (s.length < 2) return false;
-  if (!s.startsWith("\x1b")) return false;
+  if (
+    s === "\n" ||
+    s === "\x1b\r" ||
+    s === "\x1b[13;2u" ||
+    s === "\x1b[27;2;13~"
+  ) {
+    return true;
+  }
+  if (s.length < 2 || !s.startsWith("\x1b")) return false;
   return s.endsWith("\r") || s.endsWith("\n");
 }
 
-function handleKey(_str: string | undefined, key: Key): boolean {
+function handleKey(str: string | undefined, key: Key): void {
   if (key.ctrl && key.name === "c") {
     handleCtrlC();
-    return true;
+    return;
   }
-  if (key.name === "escape") return true;
+  if (key.ctrl && key.name === "l") {
+    rerenderAll();
+    return;
+  }
+  if (key.name === "escape") return;
 
   if (key.ctrl && key.name === "a") {
     editor.moveLineStart();
-    return true;
+    markTypingActivity();
+    resetExitHint();
+    return;
   }
   if (key.ctrl && key.name === "e") {
     editor.moveLineEnd();
-    return true;
+    markTypingActivity();
+    resetExitHint();
+    return;
+  }
+  if (key.name === "home") {
+    editor.moveLineStart();
+    markTypingActivity();
+    resetExitHint();
+    return;
+  }
+  if (key.name === "end") {
+    editor.moveLineEnd();
+    markTypingActivity();
+    resetExitHint();
+    return;
   }
 
-  if (looksLikeModifiedEnterSequence(key)) {
+  if (looksLikeModifiedEnterSequence(str, key)) {
     editor.insertNewline();
     noteBufferMutation();
-    return true;
+    markTypingActivity();
+    return;
   }
 
   if (key.name === "return" || key.name === "enter") {
-    if (wantsSoftNewline(key)) {
+    if (wantsSoftNewline(str, key)) {
       editor.insertNewline();
       noteBufferMutation();
-    } else onSubmit();
-    return true;
+      markTypingActivity();
+    } else {
+      onSubmit();
+    }
+    return;
   }
 
   if (key.name === "up") {
     if (editor.cur.line > 0) editor.moveUp();
     else historyPrev();
-    return true;
+    markTypingActivity();
+    resetExitHint();
+    return;
   }
+
   if (key.name === "down") {
     if (editor.cur.line < editor.lines.length - 1) editor.moveDown();
     else historyNext();
-    return true;
+    markTypingActivity();
+    resetExitHint();
+    return;
   }
+
   if (key.name === "left") {
     editor.moveLeft();
-    return true;
+    markTypingActivity();
+    resetExitHint();
+    return;
   }
+
   if (key.name === "right") {
     editor.moveRight();
-    return true;
+    markTypingActivity();
+    resetExitHint();
+    return;
   }
+
   if (key.name === "backspace") {
     editor.backspace();
     noteBufferMutation();
-    return true;
+    markTypingActivity();
+    return;
   }
+
   if (key.name === "delete" || key.name === "forwarddelete") {
     editor.deleteForward();
     noteBufferMutation();
-    return true;
+    markTypingActivity();
+    return;
   }
+
   if (key.name === "tab") {
     editor.insertText("  ");
     noteBufferMutation();
-    return true;
+    markTypingActivity();
+    return;
   }
 
   const seq = key.sequence ?? "";
   if (seq && !key.ctrl && !key.meta && key.name === undefined) {
     editor.insertText(seq);
     noteBufferMutation();
-    return true;
+    markTypingActivity();
+    return;
   }
 
-  if (_str && !key.ctrl && !key.meta) {
-    if (key.name && ["return", "enter", "tab"].includes(key.name)) return true;
-    editor.insertText(_str);
+  if (str && !key.ctrl && !key.meta) {
+    if (key.name && ["return", "enter", "tab"].includes(key.name)) return;
+    editor.insertText(str);
     noteBufferMutation();
-    return true;
+    markTypingActivity();
   }
-
-  return true;
 }
 
 function cleanup(): void {
+  isShuttingDown = true;
+  stopSpinner();
+  stopTypingIndicator();
   process.stdin.setRawMode(false);
   process.stdin.pause();
-  process.stdout.write(ansi.showCursor + ansi.reset + "\n");
+  process.stdout.write(ansi.reset + ansi.showCursor + "\n");
 }
 
 function main(): void {
@@ -402,20 +773,20 @@ function main(): void {
   process.stdin.setRawMode(true);
   process.on("SIGINT", () => {});
 
-  pushLog(
-    `${ansi.dim}──${ansi.reset} ${ansi.bold}对话式 TTY${ansi.reset} ${ansi.dim}Enter 发送 · Shift+Enter 换行 · help · 首行↑/末行↓ 历史 · Ctrl+C 清空草稿；空时再按退出${ansi.reset}`,
-  );
-  pushLog(
-    `${ansi.fg(3)}就绪。${ansi.reset} 输入 ${ansi.bold}help${ansi.reset} 查看命令。（不抢备用屏、不清整屏）`,
+  const cmd = (s: string) => `${ansi.fg(2)}${s}${ansi.reset}`;
+
+  pushSystem(
+    "Raw TTY CLI demo ready.",
+    `试试：${cmd("help")} / ${cmd("demo all")} / ${cmd("demo patch")} / ${cmd("demo colors")}`
   );
 
   process.stdin.on("keypress", (str, key) => {
     if (!key) return;
     handleKey(str, key);
-    refreshDraft();
+    refreshFooter();
   });
 
-  process.stdout.on("resize", () => refreshDraft());
+  process.stdout.on("resize", () => rerenderAll());
 }
 
 main();

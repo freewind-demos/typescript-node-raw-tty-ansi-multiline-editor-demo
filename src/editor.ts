@@ -2,6 +2,28 @@
 
 export type Cursor = { line: number; col: number };
 
+function charWidth(ch: string): number {
+  return /[\u0000-\u007f]/.test(ch) ? 1 : 2;
+}
+
+function visualWidth(text: string): number {
+  let width = 0;
+  for (const ch of text) width += charWidth(ch);
+  return width;
+}
+
+function columnForVisualWidth(text: string, targetWidth: number): number {
+  let width = 0;
+  let col = 0;
+  for (const ch of text) {
+    const nextWidth = width + charWidth(ch);
+    if (nextWidth > targetWidth) break;
+    width = nextWidth;
+    col += ch.length;
+  }
+  return col;
+}
+
 export function createEditor(initial = ""): MultilineEditor {
   const lines = initial.length ? initial.split("\n") : [""];
   return new MultilineEditor(lines, {
@@ -13,10 +35,16 @@ export function createEditor(initial = ""): MultilineEditor {
 export class MultilineEditor {
   lines: string[];
   cur: Cursor;
+  preferredVisualCol: number | null;
 
   constructor(lines: string[], cur: Cursor) {
     this.lines = lines;
     this.cur = cur;
+    this.preferredVisualCol = null;
+  }
+
+  private clearPreferredVisualCol(): void {
+    this.preferredVisualCol = null;
   }
 
   /** 粘贴或普通输入：可含换行 */
@@ -35,6 +63,7 @@ export class MultilineEditor {
     const row = this.lines[line] ?? "";
     this.lines[line] = row.slice(0, col) + ch + row.slice(col);
     this.cur = { line, col: col + 1 };
+    this.clearPreferredVisualCol();
   }
 
   insertNewline(): void {
@@ -45,6 +74,7 @@ export class MultilineEditor {
     this.lines[line] = left;
     this.lines.splice(line + 1, 0, right);
     this.cur = { line: line + 1, col: 0 };
+    this.clearPreferredVisualCol();
   }
 
   backspace(): void {
@@ -53,6 +83,7 @@ export class MultilineEditor {
     if (col > 0) {
       this.lines[line] = row.slice(0, col - 1) + row.slice(col);
       this.cur = { line, col: col - 1 };
+      this.clearPreferredVisualCol();
       return;
     }
     if (line > 0) {
@@ -61,6 +92,7 @@ export class MultilineEditor {
       this.lines.splice(line, 1);
       this.lines[line - 1] = merged;
       this.cur = { line: line - 1, col: prev.length };
+      this.clearPreferredVisualCol();
     }
   }
 
@@ -69,12 +101,14 @@ export class MultilineEditor {
     const row = this.lines[line] ?? "";
     if (col < row.length) {
       this.lines[line] = row.slice(0, col) + row.slice(col + 1);
+      this.clearPreferredVisualCol();
       return;
     }
     if (line < this.lines.length - 1) {
       const next = this.lines[line + 1] ?? "";
       this.lines[line] = row + next;
       this.lines.splice(line + 1, 1);
+      this.clearPreferredVisualCol();
     }
   }
 
@@ -82,11 +116,13 @@ export class MultilineEditor {
     const { line, col } = this.cur;
     if (col > 0) {
       this.cur = { line, col: col - 1 };
+      this.clearPreferredVisualCol();
       return;
     }
     if (line > 0) {
       const prevLen = (this.lines[line - 1] ?? "").length;
       this.cur = { line: line - 1, col: prevLen };
+      this.clearPreferredVisualCol();
     }
   }
 
@@ -95,39 +131,52 @@ export class MultilineEditor {
     const row = this.lines[line] ?? "";
     if (col < row.length) {
       this.cur = { line, col: col + 1 };
+      this.clearPreferredVisualCol();
       return;
     }
     if (line < this.lines.length - 1) {
       this.cur = { line: line + 1, col: 0 };
+      this.clearPreferredVisualCol();
     }
   }
 
   moveUp(): void {
     if (this.cur.line <= 0) return;
     const prevRow = this.lines[this.cur.line - 1] ?? "";
-    const col = Math.min(this.cur.col, prevRow.length);
+    const currentRow = this.lines[this.cur.line] ?? "";
+    const targetVisualCol =
+      this.preferredVisualCol ?? visualWidth(currentRow.slice(0, this.cur.col));
+    const col = columnForVisualWidth(prevRow, targetVisualCol);
     this.cur = { line: this.cur.line - 1, col };
+    this.preferredVisualCol = targetVisualCol;
   }
 
   moveDown(): void {
     if (this.cur.line >= this.lines.length - 1) return;
     const nextRow = this.lines[this.cur.line + 1] ?? "";
-    const col = Math.min(this.cur.col, nextRow.length);
+    const currentRow = this.lines[this.cur.line] ?? "";
+    const targetVisualCol =
+      this.preferredVisualCol ?? visualWidth(currentRow.slice(0, this.cur.col));
+    const col = columnForVisualWidth(nextRow, targetVisualCol);
     this.cur = { line: this.cur.line + 1, col };
+    this.preferredVisualCol = targetVisualCol;
   }
 
   moveLineStart(): void {
     this.cur = { line: this.cur.line, col: 0 };
+    this.clearPreferredVisualCol();
   }
 
   moveLineEnd(): void {
     const row = this.lines[this.cur.line] ?? "";
     this.cur = { line: this.cur.line, col: row.length };
+    this.clearPreferredVisualCol();
   }
 
   clear(): void {
     this.lines = [""];
     this.cur = { line: 0, col: 0 };
+    this.clearPreferredVisualCol();
   }
 
   /** 整段替换（用于历史召回） */
@@ -137,6 +186,7 @@ export class MultilineEditor {
     const last = this.lines.length - 1;
     const lastRow = this.lines[last] ?? "";
     this.cur = { line: last, col: lastRow.length };
+    this.clearPreferredVisualCol();
   }
 
   getText(): string {
